@@ -20,7 +20,14 @@ import subprocess
 import numpy as np
 import pytest
 
-from pipeline.colmap_model import CAMERA_MODELS_BY_NAME, read_model
+from pipeline.boxes import BoundingBox
+from pipeline.colmap_model import (
+    CAMERA_MODELS_BY_NAME,
+    read_model,
+    subset_model,
+    write_model,
+)
+from pipeline.commands.chunk import select_for_box
 
 from .colmap_fixtures import (
     FixtureCamera,
@@ -32,6 +39,7 @@ from .colmap_fixtures import (
     write_model_bin,
     write_model_txt,
 )
+from .splat_fixtures import build_two_room_scene
 
 COLMAP_PATH = shutil.which("colmap")
 
@@ -250,3 +258,90 @@ def test_model_analyzer_agrees_with_our_statistics(tmp_path):
         )
     if "mean_error" in found:
         assert found["mean_error"] == pytest.approx(model.mean_reprojection_error(), abs=0.01)
+
+
+# ---------------------------------------------------------------------------
+# The production writer (used by `chunk` to emit sub-models)
+# ---------------------------------------------------------------------------
+
+
+def test_colmap_reads_models_written_by_the_production_writer(tmp_path):
+    """pipeline's write_model -> colmap model_converter -> TXT.
+
+    `chunk` emits sub-models that get fed to a trainer, so "valid" has to mean
+    valid according to COLMAP, not merely re-readable by our own reader.
+    """
+    fixture = build_healthy_model(num_images=6, num_points=40, error=0.5)
+    write_model_bin(tmp_path / "src", fixture)
+    model = read_model(tmp_path / "src")
+
+    write_model(tmp_path / "written", model)
+    _convert(tmp_path / "written", tmp_path / "txt", "TXT")
+
+    names = {}
+    lines = [
+        line for line in (tmp_path / "txt" / "images.txt").read_text().splitlines()
+        if not line.startswith("#")
+    ]
+    for pose_line in lines[::2]:
+        if pose_line.strip():
+            parts = pose_line.split()
+            names[int(parts[0])] = parts[9]
+
+    assert names == {img.image_id: img.name for img in model.images.values()}
+
+    point_lines = [
+        line for line in (tmp_path / "txt" / "points3D.txt").read_text().splitlines()
+        if line.strip() and not line.startswith("#")
+    ]
+    assert len(point_lines) == model.num_points3d
+
+
+def test_production_writer_round_trips_through_colmap_unchanged(tmp_path):
+    fixture = build_healthy_model(num_images=5, num_points=30, error=0.5)
+    write_model_bin(tmp_path / "src", fixture)
+    original = read_model(tmp_path / "src")
+
+    write_model(tmp_path / "a", original)
+    _convert(tmp_path / "a", tmp_path / "txt", "TXT")
+    _convert(tmp_path / "txt", tmp_path / "b", "BIN")
+    reloaded = read_model(tmp_path / "b")
+
+    assert reloaded.num_registered_images == original.num_registered_images
+    assert reloaded.num_points3d == original.num_points3d
+    assert reloaded.num_observations == original.num_observations
+    assert {i.name for i in reloaded.images.values()} == {
+        i.name for i in original.images.values()
+    }
+    for camera_id, camera in original.cameras.items():
+        assert reloaded.cameras[camera_id].model_name == camera.model_name
+        assert reloaded.cameras[camera_id].params == camera.params
+
+
+def test_colmap_accepts_a_chunk_subset_model(tmp_path):
+    """A sub-model carved by `chunk` must satisfy real COLMAP, not just us."""
+    scene = build_two_room_scene()
+    write_model_bin(tmp_path / "src", scene.model)
+    model = read_model(tmp_path / "src")
+
+    room = scene.rooms[1]
+    selection = select_for_box(
+        model, BoundingBox(room.name, room.box_min, room.box_max), min_points_in_box=5
+    )
+    submodel, stats = subset_model(model, set(selection.image_ids), set(selection.point_ids))
+    write_model(tmp_path / "chunk", submodel)
+
+    result = subprocess.run(
+        [COLMAP_PATH, "model_analyzer", "--path", str(tmp_path / "chunk")],
+        capture_output=True, text=True,
+    )
+    assert result.returncode == 0, result.stderr
+    output = result.stdout + result.stderr
+
+    match = re.search(r"Registered images:\s*([0-9]+)", output)
+    assert match, output
+    assert int(match.group(1)) == stats.images
+    match = re.search(r"Points:\s*([0-9]+)", output)
+    assert match and int(match.group(1)) == stats.points
+    # The doorway observer must have survived into the chunk COLMAP just read.
+    assert stats.images > len(room.image_ids)

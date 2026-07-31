@@ -1,9 +1,10 @@
-"""Hand-rolled reader for COLMAP sparse-model binaries.
+"""Hand-rolled reader and writer for COLMAP sparse-model binaries.
 
-Reads `cameras.bin`, `images.bin` and `points3D.bin` without depending on
-pycolmap. Correctness is the priority here: `verify` reports on a capture that
-cannot be re-shot, so this module fails loudly and specifically rather than
-ever returning partial or plausible-but-wrong data.
+Reads and writes `cameras.bin`, `images.bin` and `points3D.bin` without
+depending on pycolmap, and builds self-consistent sub-models (used by `chunk`).
+Correctness is the priority here: `verify` reports on a capture that cannot be
+re-shot, so this module fails loudly and specifically rather than ever
+returning partial or plausible-but-wrong data.
 
 Binary layout notes worth knowing before editing:
 
@@ -814,3 +815,212 @@ def find_models(sparse_dir: Path) -> list[Path]:
     if all(p.name.isdigit() for p in models):
         models.sort(key=lambda p: int(p.name))
     return models
+
+
+# ---------------------------------------------------------------------------
+# Writing
+# ---------------------------------------------------------------------------
+
+
+def write_cameras_binary(path: Path, cameras: dict[int, Camera]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chunks = [_U64.pack(len(cameras))]
+    for camera_id in sorted(cameras):
+        camera = cameras[camera_id]
+        spec = CAMERA_MODELS.get(camera.model_id)
+        if spec is None:
+            raise UnknownCameraModelError(
+                f"cannot write camera {camera_id}: unknown model id {camera.model_id}"
+            )
+        if len(camera.params) != spec.num_params:
+            raise InconsistentModelError(
+                f"camera {camera_id} ({spec.name}) has {len(camera.params)} params, "
+                f"expected {spec.num_params}"
+            )
+        chunks.append(
+            _CAMERA_HEADER.pack(camera_id, camera.model_id, camera.width, camera.height)
+        )
+        chunks.append(struct.pack(f"<{spec.num_params}d", *camera.params))
+    path.write_bytes(b"".join(chunks))
+
+
+def write_images_binary(path: Path, images: dict[int, Image]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chunks = [_U64.pack(len(images))]
+    for image_id in sorted(images):
+        image = images[image_id]
+        chunks.append(
+            _IMAGE_HEADER.pack(image_id, *image.qvec, *image.tvec, image.camera_id)
+        )
+        chunks.append(image.name.encode("utf-8", errors="surrogateescape") + b"\x00")
+        if image.points2d is None:
+            # Reading with read_points2d=False discards the feature table; a
+            # model written from that would silently lose every 2D observation,
+            # so refuse rather than emit a lossy file.
+            raise InconsistentModelError(
+                f"image {image.name} was read without its point2D data and cannot be "
+                f"written; re-read the model with read_points2d=True"
+            )
+        chunks.append(_U64.pack(len(image.points2d)))
+        chunks.append(image.points2d.astype(_POINT2D_DTYPE, copy=False).tobytes())
+    path.write_bytes(b"".join(chunks))
+
+
+def write_points3d_binary(path: Path, points: Points3D) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    chunks = [_U64.pack(len(points))]
+    offsets = points.track_offsets
+    for i in range(len(points)):
+        lo, hi = int(offsets[i]), int(offsets[i + 1])
+        chunks.append(
+            _POINT3D_HEADER.pack(
+                int(points.ids[i]),
+                float(points.xyz[i, 0]), float(points.xyz[i, 1]), float(points.xyz[i, 2]),
+                int(points.rgb[i, 0]), int(points.rgb[i, 1]), int(points.rgb[i, 2]),
+                float(points.error[i]),
+                hi - lo,
+            )
+        )
+        if hi > lo:
+            track = np.empty((hi - lo, 2), dtype="<u4")
+            track[:, 0] = points.track_image_ids[lo:hi]
+            track[:, 1] = points.track_point2d_idxs[lo:hi]
+            chunks.append(track.tobytes())
+    path.write_bytes(b"".join(chunks))
+
+
+def write_model(model_dir: Path, model: Model) -> Path:
+    """Write a model as the three COLMAP binaries. Returns the directory."""
+    model_dir = Path(model_dir)
+    model_dir.mkdir(parents=True, exist_ok=True)
+    write_cameras_binary(model_dir / "cameras.bin", model.cameras)
+    write_images_binary(model_dir / "images.bin", model.images)
+    write_points3d_binary(model_dir / "points3D.bin", model.points3d)
+    return model_dir
+
+
+@dataclass
+class SubsetStats:
+    images: int
+    cameras: int
+    points: int
+    observations: int
+    points_dropped_short_track: int
+
+
+def subset_model(
+    model: Model,
+    image_ids: set[int],
+    point_ids: set[int],
+    *,
+    min_track_length: int = 2,
+    path: Path | None = None,
+) -> tuple[Model, SubsetStats]:
+    """Build a self-consistent sub-model from a set of images and 3D points.
+
+    The two sides have to be reconciled or the result is not a valid model:
+    kept points may be observed by dropped images, and kept images certainly
+    observe dropped points. So tracks are filtered to kept images, and each
+    kept image's feature table has its references to dropped points reset to
+    the invalid sentinel.
+
+    Each image keeps its *full* 2D feature list rather than a compacted one.
+    That is deliberate: track entries address features by index, so renumbering
+    them would invalidate every `point2D_idx` in the model.
+    """
+    kept_images = {i: model.images[i] for i in sorted(image_ids) if i in model.images}
+    if not kept_images:
+        raise InconsistentModelError("subset would contain no images")
+
+    points = model.points3d
+    keep_indices: list[int] = []
+    new_tracks: list[np.ndarray] = []
+    dropped_short = 0
+
+    for i in range(len(points)):
+        if int(points.ids[i]) not in point_ids:
+            continue
+        lo, hi = int(points.track_offsets[i]), int(points.track_offsets[i + 1])
+        image_slice = points.track_image_ids[lo:hi]
+        mask = np.fromiter(
+            (int(v) in kept_images for v in image_slice.tolist()), dtype=bool, count=hi - lo
+        )
+        if int(mask.sum()) < min_track_length:
+            dropped_short += 1
+            continue
+        keep_indices.append(i)
+        track = np.empty((int(mask.sum()), 2), dtype=np.uint32)
+        track[:, 0] = image_slice[mask]
+        track[:, 1] = points.track_point2d_idxs[lo:hi][mask]
+        new_tracks.append(track)
+
+    if keep_indices:
+        index = np.array(keep_indices, dtype=np.int64)
+        lengths = np.array([t.shape[0] for t in new_tracks], dtype=np.int64)
+        flat = np.concatenate(new_tracks) if new_tracks else np.zeros((0, 2), dtype=np.uint32)
+        track_offsets = np.zeros(len(keep_indices) + 1, dtype=np.int64)
+        np.cumsum(lengths, out=track_offsets[1:])
+        new_points = Points3D(
+            ids=points.ids[index].copy(),
+            xyz=points.xyz[index].copy(),
+            rgb=points.rgb[index].copy(),
+            error=points.error[index].copy(),
+            track_offsets=track_offsets,
+            track_image_ids=np.ascontiguousarray(flat[:, 0]),
+            track_point2d_idxs=np.ascontiguousarray(flat[:, 1]),
+        )
+    else:
+        new_points = Points3D(
+            ids=np.zeros(0, dtype=np.uint64),
+            xyz=np.zeros((0, 3), dtype=np.float64),
+            rgb=np.zeros((0, 3), dtype=np.uint8),
+            error=np.zeros(0, dtype=np.float64),
+            track_offsets=np.zeros(1, dtype=np.int64),
+            track_image_ids=np.zeros(0, dtype=np.uint32),
+            track_point2d_idxs=np.zeros(0, dtype=np.uint32),
+        )
+
+    surviving = set(new_points.ids.tolist())
+    rebuilt: dict[int, Image] = {}
+    for image_id, image in kept_images.items():
+        if image.points2d is None:
+            raise InconsistentModelError(
+                f"image {image.name} was read without point2D data; re-read the model "
+                f"with read_points2d=True before subsetting"
+            )
+        features = image.points2d.copy()
+        ids = features["point3D_id"]
+        drop = ids != INVALID_POINT3D_ID
+        if drop.any():
+            keep_mask = np.isin(ids, np.fromiter(surviving, dtype=np.uint64, count=len(surviving)))
+            ids[~keep_mask] = INVALID_POINT3D_ID
+        rebuilt[image_id] = Image(
+            image_id=image.image_id,
+            qvec=image.qvec,
+            tvec=image.tvec,
+            camera_id=image.camera_id,
+            name=image.name,
+            num_points2d=image.num_points2d,
+            points2d=features,
+        )
+
+    camera_ids = {img.camera_id for img in rebuilt.values()}
+    missing = camera_ids - set(model.cameras)
+    if missing:
+        raise InconsistentModelError(f"subset references unknown camera id(s) {sorted(missing)}")
+    cameras = {cid: model.cameras[cid] for cid in sorted(camera_ids)}
+
+    subset = Model(
+        path=path or model.path,
+        cameras=cameras,
+        images=rebuilt,
+        points3d=new_points,
+    )
+    stats = SubsetStats(
+        images=len(rebuilt),
+        cameras=len(cameras),
+        points=len(new_points),
+        observations=new_points.num_observations,
+        points_dropped_short_track=dropped_short,
+    )
+    return subset, stats

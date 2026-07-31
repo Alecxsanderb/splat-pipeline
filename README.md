@@ -43,8 +43,8 @@ splat select     # choose a sharp, well-distributed subset of images (implemente
 splat organize   # lay out selected images by camera model for COLMAP (implemented)
 splat sfm        # run COLMAP + GLOMAP structure-from-motion (implemented)
 splat verify     # sanity-check the reconstruction (implemented)
-splat chunk      # split a large reconstruction into overlapping chunks (stub)
-splat merge      # recombine chunked results (stub)
+splat chunk      # split a reconstruction into per-room chunks (implemented)
+splat merge      # crop and recombine trained chunk splats (implemented)
 ```
 
 Each run logs to the console and to a timestamped file under `logs/`
@@ -205,6 +205,94 @@ written even on exit 3), `registration_by_group.csv`,
 `camera_positions_top_down.png`. `verify` only ever writes inside that
 directory — it never modifies the model or the COLMAP database.
 
+### chunk
+
+Carves the global reconstruction into per-room sub-models small enough to
+train inside a fixed VRAM budget. Rooms are given as a YAML file of named
+axis-aligned boxes:
+
+```yaml
+boxes:
+  - name: kitchen
+    min: [-2.0, -1.0, 0.0]
+    max: [ 3.0,  2.5, 2.8]
+  - name: hallway
+    min: [ 3.0, -1.0, 0.0]
+    max: [ 6.5,  2.5, 2.8]
+```
+
+For each box, two kinds of image are selected: cameras standing **inside** the
+box, plus cameras anywhere else that observe at least
+`chunk.min_points_in_box` of the box's 3D points. That second rule is what
+picks up a view from the hallway looking in through a doorway — without it a
+room trains with no coverage of the wall its own door is in.
+
+Each chunk is written as a self-contained COLMAP model under
+`<output_dir>/chunks/<name>/sparse/0/`, alongside a `manifest.json` recording
+the box, the image and point counts, and how many images came in through a
+doorway. Making the subset *valid* takes some care: tracks are filtered to the
+kept images, and each kept image's feature table has its references to dropped
+points reset to the invalid sentinel. Feature tables are never compacted,
+because track entries address features by index.
+
+```bash
+splat chunk --boxes boxes.yaml
+splat chunk --boxes boxes.yaml --min-points-in-box 100
+```
+
+Chunks deliberately overlap; `chunk` reports the overlap factor, warns when a
+chunk looks too big for the Gaussian budget, and warns about any points that
+fall outside every box (geometry that would go missing from the merge).
+
+#### chunk --suggest
+
+Rather than hand-writing a dozen boxes, cluster the camera positions and get a
+starting YAML:
+
+```bash
+splat chunk --suggest                          # DBSCAN (room count is inferred)
+splat chunk --suggest --eps 2.0
+splat chunk --suggest --suggest-method kmeans --clusters 8
+```
+
+Each cluster's box is grown from the camera positions to cover the geometry
+those cameras see, so it includes the room's walls rather than just the path
+walked through it. Points are assigned to the cluster that observes them
+*most*, not to every cluster that can see them — otherwise a single camera
+angled through a doorway stretches one room's box across its neighbour and the
+suggestions become useless as chunks. The sparse point count per box is
+reported as a rough proxy for the trained Gaussian count, with a warning when
+a box looks likely to exceed `chunk.target_gaussians_max`.
+
+The output is a normal boxes file: rename the rooms, adjust the bounds, and
+feed it straight back to `splat chunk --boxes`.
+
+### merge
+
+Loads each chunk's trained `.ply`, crops it back to its manifest's box, and
+concatenates the results. Cropping is the point: chunks overlap by design, so
+concatenating them raw would leave doubled, z-fighting geometry at every shared
+wall. `merge.crop_margin` widens the kept region slightly so seams are not
+razor-thin.
+
+Every PLY property is preserved — position, normals, DC and higher-order
+spherical-harmonic coefficients, opacity, scale and rotation quaternion. The
+reader is schema-agnostic: it carries through whatever properties the header
+declares, in order, so splats trained at any SH degree work. Merging splats
+with *different* SH degrees is refused rather than silently padded, since that
+would corrupt the appearance of whichever chunk got coerced.
+
+```bash
+splat merge
+splat merge --crop-margin 0.5
+splat merge --no-crop            # keep the overlap (will duplicate geometry)
+```
+
+Gaussian counts are reported per chunk and in total, before and after
+cropping. Trained splats are found by searching each chunk directory
+recursively for `merge.ply_name`, so the nested layout 3DGS produces
+(`point_cloud/iteration_30000/point_cloud.ply`) is picked up automatically.
+
 ### Per-source overrides
 
 Global sweep footage typically needs a lower fps / larger window than
@@ -273,6 +361,20 @@ verify:
 chunk:
   max_images_per_chunk: 1500
   overlap: 100
+  min_points_in_box: 50        # in-box points an outside image must see to join
+  min_track_length: 2          # drop chunk points seen by fewer kept images
+  target_gaussians_min: 500000
+  target_gaussians_max: 1500000
+  suggest_method: dbscan       # or kmeans
+  suggest_eps: 1.5
+  suggest_min_samples: 10
+  suggest_clusters: 8
+  suggest_padding: 0.25
+
+merge:
+  crop_margin: 0.25
+  ply_name: point_cloud.ply
+  output_name: merged.ply
 
 logging:
   level: INFO

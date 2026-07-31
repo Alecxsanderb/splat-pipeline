@@ -95,8 +95,39 @@ class VerifyConfig:
 
 @dataclass
 class ChunkConfig:
+    """Carving a reconstruction into per-room chunks that fit in VRAM.
+
+    `target_gaussians_*` bound what one chunk should cost to train. They are
+    advisory: `chunk` reports the sparse point count per box as a proxy and
+    warns when a box looks out of range, rather than refusing to emit it.
+    """
+
     max_images_per_chunk: int = 1500
     overlap: int = 100
+    # An image outside the box still belongs to the chunk if it observes at
+    # least this many of the box's points -- this is what keeps views looking
+    # in through a doorway from an adjacent room.
+    min_points_in_box: int = 50
+    point_margin: float = 0.0  # grow the box by this much when selecting points
+    min_track_length: int = 2  # drop chunk points observed by fewer than this many kept images
+    target_gaussians_min: int = 500_000
+    target_gaussians_max: int = 1_500_000
+    # --suggest
+    suggest_method: str = "dbscan"  # "dbscan" | "kmeans"
+    suggest_eps: float = 1.5  # DBSCAN neighbourhood radius, in model units
+    suggest_min_samples: int = 10
+    suggest_clusters: int = 8  # k, when suggest_method is "kmeans"
+    suggest_percentile: float = 2.0  # trim this % off each end when sizing a box
+    suggest_padding: float = 0.25  # grow each suggested box by this much
+
+
+@dataclass
+class MergeConfig:
+    """Recombining trained per-chunk splats into one point cloud."""
+
+    crop_margin: float = 0.25  # grow each manifest box by this before cropping
+    ply_name: str = "point_cloud.ply"
+    output_name: str = "merged.ply"
 
 
 @dataclass
@@ -114,6 +145,7 @@ class PipelineConfig:
     sfm: SfmConfig = field(default_factory=SfmConfig)
     verify: VerifyConfig = field(default_factory=VerifyConfig)
     chunk: ChunkConfig = field(default_factory=ChunkConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     overrides: list[SourceOverride] = field(default_factory=list)
 
