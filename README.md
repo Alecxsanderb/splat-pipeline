@@ -42,7 +42,7 @@ splat extract    # sample frames from source video (implemented)
 splat select     # choose a sharp, well-distributed subset of images (implemented)
 splat organize   # lay out selected images by camera model for COLMAP (implemented)
 splat sfm        # run COLMAP + GLOMAP structure-from-motion (implemented)
-splat verify     # sanity-check the reconstruction (stub)
+splat verify     # sanity-check the reconstruction (implemented)
 splat chunk      # split a large reconstruction into overlapping chunks (stub)
 splat merge      # recombine chunked results (stub)
 ```
@@ -133,6 +133,78 @@ summary for every stage (including skipped ones) is written to
 splat sfm --config config.yaml
 ```
 
+### verify
+
+Reads the COLMAP sparse model (with its own binary reader — no `pycolmap`
+dependency) and reports whether the reconstruction actually worked:
+
+- **Registered vs total input images**, as a count and a percentage. The
+  denominator is the files under `<output_dir>/images/`, since `images.bin`
+  only ever contains registered images. When `<workdir>/sfm/database.db` is
+  readable, a third count is reported so the loss is split into *images COLMAP
+  never ingested* versus *images it could not place* — different problems with
+  different fixes.
+- **Number of separate models** in `sparse/`. More than one means the scene
+  fragmented into unrelated reconstructions, and is a hard failure. The
+  largest model is analyzed in detail; the rest are summarized.
+- **Reprojection error** — mean, median, p90, max, plus an
+  observation-weighted mean. These come from the per-point `error` field in
+  `points3D.bin`, which is what COLMAP itself reports. If the mapper never
+  populated that field, it is reported as *unavailable* rather than as a
+  flattering `0.00 px`.
+- **Mean track length** and the distribution of observations per image.
+- **Per-source-folder and per-clip registration rates**, so a room that failed
+  to register is immediately visible. A folder with zero registered images is
+  a hard failure.
+- **Camera trajectory extent and bounding box** (in COLMAP's arbitrary units).
+- **An image connectivity graph**: images sharing at least
+  `verify.min_common_points` 3D points are connected. The number of connected
+  components is reported, along with a curve showing how that count changes
+  with the threshold — "one component at N=5 but seven at N=30" means the
+  scene is only just holding together.
+
+When the graph has more than one component, `verify` lists the images at each
+boundary and writes `candidate_pairs.txt`, ready to feed to
+`colmap matches_importer` to try to bridge the gap. Pairs that already share
+3D points are excluded from that file — they have already been matched, so
+re-matching them would change nothing; they appear in
+`boundary_candidates.csv` as diagnostics instead. For components sharing no
+points at all, candidates fall back to camera proximity, filtered by viewing
+direction so that two cameras a short distance apart but facing through a wall
+are not proposed.
+
+A top-down PNG of camera positions is written for eyeballing whether the
+result looks like a floor plan. Because COLMAP's world frame is arbitrary, the
+view is the plane of the two dominant principal axes of the camera centres
+rather than a fixed axis pair; points are coloured by source folder, marked by
+component, and joined in capture order.
+
+```bash
+splat verify --config config.yaml
+splat verify --config config.yaml --no-plot
+splat verify --config config.yaml --min-registration 0.8 --min-common-points 50
+```
+
+Exit codes:
+
+| code | meaning |
+|---|---|
+| 0 | every fail-severity check passed (warnings may still be present) |
+| 1 | verification ran and something is wrong with the reconstruction |
+| 3 | verification could not run at all (no model, or no input images) |
+
+Failures are: more than one model; registration below
+`verify.min_registration_rate`; more than one connected component of at least
+`verify.min_component_size` images; an empty model; or a source folder that
+registered nothing. Smaller stray components are reported loudly but do not on
+their own fail the run.
+
+Artifacts land in `<workdir>/verify/`: `verify_report.json` (everything,
+written even on exit 3), `registration_by_group.csv`,
+`boundary_candidates.csv`, `candidate_pairs.txt`, and
+`camera_positions_top_down.png`. `verify` only ever writes inside that
+directory — it never modifies the model or the COLMAP database.
+
 ### Per-source overrides
 
 Global sweep footage typically needs a lower fps / larger window than
@@ -186,6 +258,18 @@ sfm:
   use_gpu: false
   vocab_tree_path: vocab_tree.bin
 
+verify:
+  min_registration_rate: 0.90    # FAIL below this
+  warn_registration_rate: 0.95   # WARN below this
+  min_common_points: 30          # shared 3D points needed for a graph edge
+  min_component_size: 10         # smaller components don't fail the run
+  min_observations_per_image: 50
+  warn_mean_reprojection_error: 1.5
+  component_thresholds: [5, 10, 15, 30, 50, 100]
+  max_track_length: 300
+  max_pair_candidates: 500
+  plot: true
+
 chunk:
   max_images_per_chunk: 1500
   overlap: 100
@@ -218,6 +302,24 @@ GPU→CPU fallback are covered by mocking only the subprocess-execution layer
 a tiny synthetic image set with genuine inter-image overlap; it's skipped
 automatically if `colmap` isn't on `PATH`.
 
+The COLMAP binary reader behind `verify` is validated in three layers, because
+a reader checked only against our own writer proves nothing if both share the
+same misunderstanding of the format:
+
+1. **Golden bytes** — hand-computed byte literals asserted in both directions,
+   pinning the on-disk layout independently of reader *and* writer.
+2. **Round-trip** against `tests/colmap_fixtures.py`, which deliberately
+   re-declares its own struct formats rather than importing the reader's. This
+   layer also covers the corruption cases real COLMAP cannot produce for us:
+   truncation, inflated record counts, trailing bytes, unknown camera models,
+   and images/points3D cross-references that disagree.
+3. **Real COLMAP** (`colmap_integration`) — models are pushed through
+   `colmap model_converter` in both directions, and `colmap model_analyzer` is
+   used as an independent oracle for the computed statistics. This uses the
+   converter rather than `mapper` on purpose: `mapper` routinely fails to
+   initialize on synthetic imagery, so depending on it would make the check
+   flaky rather than rigorous.
+
 ```bash
-pytest -q -m colmap_integration   # run just the real-COLMAP integration test
+pytest -q -m colmap_integration   # run just the real-COLMAP integration tests
 ```

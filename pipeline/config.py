@@ -66,6 +66,34 @@ class SfmConfig:
 
 
 @dataclass
+class VerifyConfig:
+    """Thresholds and knobs for reconstruction verification.
+
+    Note there are deliberately no Path fields here: report paths derive from
+    `paths.workdir / "verify"`, matching how sfm/select hardcode their own
+    subdirectories. Every field needs a concrete non-None default of its
+    intended type, because the YAML merge coerces based on the current value's
+    runtime type.
+    """
+
+    min_registration_rate: float = 0.90  # FAIL below this
+    warn_registration_rate: float = 0.95  # WARN below this
+    min_common_points: int = 30  # shared 3D points needed for a graph edge
+    min_component_size: int = 10  # smaller components don't fail the run
+    min_observations_per_image: int = 50  # WARN: registered but weakly tied
+    warn_mean_reprojection_error: float = 1.5  # px; WARN only, never FAIL
+    component_thresholds: tuple[int, ...] = (5, 10, 15, 30, 50, 100)
+    max_track_length: int = 300  # longer tracks skip pair counting
+    max_pair_candidates: int = 500
+    pairs_per_component_pair: int = 50
+    spatial_neighbors_per_image: int = 3
+    max_view_angle_deg: float = 90.0
+    image_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png")
+    plot: bool = True
+    plot_dpi: int = 150
+
+
+@dataclass
 class ChunkConfig:
     max_images_per_chunk: int = 1500
     overlap: int = 100
@@ -84,6 +112,7 @@ class PipelineConfig:
     select: SelectConfig = field(default_factory=SelectConfig)
     organize: OrganizeConfig = field(default_factory=OrganizeConfig)
     sfm: SfmConfig = field(default_factory=SfmConfig)
+    verify: VerifyConfig = field(default_factory=VerifyConfig)
     chunk: ChunkConfig = field(default_factory=ChunkConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     overrides: list[SourceOverride] = field(default_factory=list)
