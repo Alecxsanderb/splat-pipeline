@@ -25,9 +25,13 @@ def test_default_config_values():
     assert config.select.workers == 4
 
     assert config.organize.group_by_camera_model is True
+    assert config.organize.photo_extensions == (".jpg", ".jpeg", ".png")
+    assert config.organize.suspicious_min_images == 20
 
     assert config.sfm.matcher == "sequential"
     assert config.sfm.camera_model == "OPENCV"
+    assert config.sfm.use_gpu is False
+    assert config.sfm.vocab_tree_path == Path("vocab_tree.bin")
 
     assert config.chunk.max_images_per_chunk == 1500
     assert config.chunk.overlap == 100

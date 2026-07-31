@@ -53,12 +53,16 @@ class SourceOverride:
 @dataclass
 class OrganizeConfig:
     group_by_camera_model: bool = True
+    photo_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png")
+    suspicious_min_images: int = 20
 
 
 @dataclass
 class SfmConfig:
     matcher: str = "sequential"
     camera_model: str = "OPENCV"
+    use_gpu: bool = False
+    vocab_tree_path: Path = Path("vocab_tree.bin")
 
 
 @dataclass

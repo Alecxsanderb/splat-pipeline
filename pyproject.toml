@@ -27,6 +27,9 @@ include = ["pipeline*"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = [
+    "colmap_integration: exercises real colmap/glomap binaries; skipped if not on PATH",
+]
 
 [tool.ruff]
 target-version = "py311"
