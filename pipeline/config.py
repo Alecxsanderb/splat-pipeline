@@ -1,0 +1,226 @@
+"""Pipeline configuration: nested dataclasses with defaults, loadable from YAML."""
+
+from __future__ import annotations
+
+import dataclasses
+import typing
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import yaml
+
+
+@dataclass
+class Paths:
+    input_video_dir: Path = Path("input/video")
+    input_photo_dir: Path = Path("input/photos")
+    workdir: Path = Path("work")
+    output_dir: Path = Path("output")
+
+
+@dataclass
+class ExtractConfig:
+    fps: float = 4.0
+    max_dimension: int = 3840
+    video_extensions: tuple[str, ...] = (".mp4", ".mov", ".hevc")
+    workers: int = 4
+
+
+@dataclass
+class SelectConfig:
+    target_min: int = 4000
+    target_max: int = 5500
+    blur_threshold: float = 100.0
+    window_size: int = 4
+    workers: int = 4
+
+
+@dataclass
+class SourceOverride:
+    """Per-source-directory override of fps (extract) and/or window_size (select).
+
+    `path` is matched as a directory prefix, relative to `paths.input_video_dir`
+    (and mirrored under the extracted frames tree). The most specific
+    (longest) matching prefix wins.
+    """
+
+    path: str = ""
+    fps: float | None = None
+    window_size: int | None = None
+
+
+@dataclass
+class OrganizeConfig:
+    group_by_camera_model: bool = True
+    photo_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png")
+    suspicious_min_images: int = 20
+
+
+@dataclass
+class SfmConfig:
+    matcher: str = "sequential"
+    camera_model: str = "OPENCV"
+    use_gpu: bool = False
+    vocab_tree_path: Path = Path("vocab_tree.bin")
+
+
+@dataclass
+class VerifyConfig:
+    """Thresholds and knobs for reconstruction verification.
+
+    Note there are deliberately no Path fields here: report paths derive from
+    `paths.workdir / "verify"`, matching how sfm/select hardcode their own
+    subdirectories. Every field needs a concrete non-None default of its
+    intended type, because the YAML merge coerces based on the current value's
+    runtime type.
+    """
+
+    min_registration_rate: float = 0.90  # FAIL below this
+    warn_registration_rate: float = 0.95  # WARN below this
+    min_common_points: int = 30  # shared 3D points needed for a graph edge
+    min_component_size: int = 10  # smaller components don't fail the run
+    min_observations_per_image: int = 50  # WARN: registered but weakly tied
+    warn_mean_reprojection_error: float = 1.5  # px; WARN only, never FAIL
+    component_thresholds: tuple[int, ...] = (5, 10, 15, 30, 50, 100)
+    max_track_length: int = 300  # longer tracks skip pair counting
+    max_pair_candidates: int = 500
+    pairs_per_component_pair: int = 50
+    spatial_neighbors_per_image: int = 3
+    max_view_angle_deg: float = 90.0
+    image_extensions: tuple[str, ...] = (".jpg", ".jpeg", ".png")
+    plot: bool = True
+    plot_dpi: int = 150
+
+
+@dataclass
+class ChunkConfig:
+    """Carving a reconstruction into per-room chunks that fit in VRAM.
+
+    `target_gaussians_*` bound what one chunk should cost to train. They are
+    advisory: `chunk` reports the sparse point count per box as a proxy and
+    warns when a box looks out of range, rather than refusing to emit it.
+    """
+
+    max_images_per_chunk: int = 1500
+    overlap: int = 100
+    # An image outside the box still belongs to the chunk if it observes at
+    # least this many of the box's points -- this is what keeps views looking
+    # in through a doorway from an adjacent room.
+    min_points_in_box: int = 50
+    point_margin: float = 0.0  # grow the box by this much when selecting points
+    min_track_length: int = 2  # drop chunk points observed by fewer than this many kept images
+    target_gaussians_min: int = 500_000
+    target_gaussians_max: int = 1_500_000
+    # --suggest
+    suggest_method: str = "dbscan"  # "dbscan" | "kmeans"
+    suggest_eps: float = 1.5  # DBSCAN neighbourhood radius, in model units
+    suggest_min_samples: int = 10
+    suggest_clusters: int = 8  # k, when suggest_method is "kmeans"
+    suggest_percentile: float = 2.0  # trim this % off each end when sizing a box
+    suggest_padding: float = 0.25  # grow each suggested box by this much
+
+
+@dataclass
+class MergeConfig:
+    """Recombining trained per-chunk splats into one point cloud."""
+
+    crop_margin: float = 0.25  # grow each manifest box by this before cropping
+    ply_name: str = "point_cloud.ply"
+    output_name: str = "merged.ply"
+
+
+@dataclass
+class LoggingConfig:
+    level: str = "INFO"
+    log_dir: Path = Path("logs")
+
+
+@dataclass
+class PipelineConfig:
+    paths: Paths = field(default_factory=Paths)
+    extract: ExtractConfig = field(default_factory=ExtractConfig)
+    select: SelectConfig = field(default_factory=SelectConfig)
+    organize: OrganizeConfig = field(default_factory=OrganizeConfig)
+    sfm: SfmConfig = field(default_factory=SfmConfig)
+    verify: VerifyConfig = field(default_factory=VerifyConfig)
+    chunk: ChunkConfig = field(default_factory=ChunkConfig)
+    merge: MergeConfig = field(default_factory=MergeConfig)
+    logging: LoggingConfig = field(default_factory=LoggingConfig)
+    overrides: list[SourceOverride] = field(default_factory=list)
+
+    @classmethod
+    def default(cls) -> PipelineConfig:
+        return cls()
+
+    @classmethod
+    def from_yaml(cls, path: Path) -> PipelineConfig:
+        path = Path(path)
+        if not path.is_file():
+            raise FileNotFoundError(f"Config file not found: {path}")
+
+        with path.open("r") as f:
+            data = yaml.safe_load(f) or {}
+
+        config = cls.default()
+        _merge_dataclass(config, data, context=path.as_posix())
+        return config
+
+
+def _list_element_type(hint: Any) -> Any:
+    args = typing.get_args(hint)
+    return args[0] if args else None
+
+
+def _merge_dataclass(instance: Any, data: dict, context: str) -> None:
+    """Recursively merge a dict of overrides into a dataclass instance in place."""
+    if not isinstance(data, dict):
+        raise ValueError(f"{context}: expected a mapping, got {type(data).__name__}")
+
+    field_names = {f.name: f for f in dataclasses.fields(instance)}
+    type_hints = typing.get_type_hints(type(instance))
+    for key, value in data.items():
+        if key not in field_names:
+            raise ValueError(f"{context}: unknown config key '{key}'")
+
+        current = getattr(instance, key)
+        if dataclasses.is_dataclass(current):
+            _merge_dataclass(current, value, context=f"{context}.{key}")
+        elif isinstance(current, list):
+            if not isinstance(value, list):
+                raise ValueError(f"{context}.{key}: expected a list")
+            element_type = _list_element_type(type_hints.get(key))
+            if element_type is not None and dataclasses.is_dataclass(element_type):
+                new_items = []
+                for i, item in enumerate(value):
+                    element = element_type()
+                    _merge_dataclass(element, item, context=f"{context}.{key}[{i}]")
+                    new_items.append(element)
+                setattr(instance, key, new_items)
+            else:
+                setattr(instance, key, list(value))
+        elif isinstance(current, Path):
+            setattr(instance, key, Path(value))
+        elif isinstance(current, tuple):
+            setattr(instance, key, tuple(value))
+        else:
+            setattr(instance, key, value)
+
+
+def resolve_override(
+    overrides: list[SourceOverride], relative_dir: Path
+) -> SourceOverride | None:
+    """Return the override whose `path` is the longest matching directory prefix
+    of `relative_dir`, or None if no override applies."""
+    relative_parts = Path(relative_dir).parts
+    best: SourceOverride | None = None
+    best_length = -1
+    for override in overrides:
+        override_parts = Path(override.path).parts
+        if len(override_parts) <= len(relative_parts) and (
+            relative_parts[: len(override_parts)] == override_parts
+        ):
+            if len(override_parts) > best_length:
+                best = override
+                best_length = len(override_parts)
+    return best
